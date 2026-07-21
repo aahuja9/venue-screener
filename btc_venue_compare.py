@@ -925,8 +925,32 @@ tick(); arm();
 </script></body></html>"""
 
 
+DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")  # set to enable HTTP Basic Auth
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        if not DASH_PASSWORD:
+            return True  # no password configured (local use) -> open
+        import base64
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(h[6:]).decode()
+                return decoded.split(":", 1)[-1] == DASH_PASSWORD
+            except Exception:
+                return False
+        return False
+
     def do_GET(self):
+        if not self._authorized():
+            body = b"Authentication required"
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="venue-screener"')
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
@@ -969,5 +993,8 @@ if __name__ == "__main__":
     _init_db()
     _load_history()
     threading.Thread(target=_sampler, daemon=True).start()
-    print(f"Perp slippage comparison -> http://localhost:{PORT}")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    # Deployed (PORT env set, e.g. Render): bind all interfaces. Local: loopback only.
+    port = int(os.environ.get("PORT", PORT))
+    host = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
+    print(f"Perp slippage comparison -> http://{host}:{port}")
+    ThreadingHTTPServer((host, port), Handler).serve_forever()

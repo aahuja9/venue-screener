@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: venue-screener
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 btc_venue_compare.py
+    envVars:
+      - key: DASH_PASSWORD
+        sync: false
