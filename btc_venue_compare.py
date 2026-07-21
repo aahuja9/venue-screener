@@ -21,7 +21,13 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8900
 DB_PATH = "venue_samples.db"  # durable sample store (survives restarts)
-PAIRS = ["BTC", "ETH", "SOL", "HYPE", "XAU", "XAG"]
+PAIRS = ["BTC", "ETH", "SOL", "HYPE", "XAU", "XAG", "TSLA", "NVDA", "AAPL", "US500"]
+# Asset-class sections shown in the UI pair selector.
+ASSET_CLASSES = {
+    "Crypto": ["BTC", "ETH", "SOL", "HYPE"],
+    "Commodities": ["XAU", "XAG"],
+    "Equities": ["TSLA", "NVDA", "AAPL", "US500"],
+}
 NOTIONALS = [10_000, 25_000, 50_000, 100_000, 250_000, 500_000]  # USD trade sizes to simulate
 SAMPLE_SECONDS = 5
 STATS_WINDOW_MIN = 10   # window for the mean/median columns in the Live tab
@@ -101,13 +107,14 @@ def book_hyperliquid(pair):
 
 def book_tradexyz(pair):
     # trade.xyz = HIP-3 builder dex "xyz" on Hyperliquid; same l2Book API,
-    # coins prefixed "xyz:". Only commodities/equities — metals map below.
-    return _hl_book({"XAU": "xyz:GOLD", "XAG": "xyz:SILVER"}[pair])
+    # coins prefixed "xyz:". Commodities + equities; specials map below.
+    sym = {"XAU": "xyz:GOLD", "XAG": "xyz:SILVER", "US500": "xyz:SP500"}.get(pair, f"xyz:{pair}")
+    return _hl_book(sym)
 
 
 def book_qfex(pair):
     # QFEX has no REST book; grab one pulsed level2 snapshot over websocket.
-    sym = {"XAU": "GOLD-USD", "XAG": "SILVER-USD"}[pair]
+    sym = {"XAU": "GOLD-USD", "XAG": "SILVER-USD"}.get(pair, f"{pair}-USD")
     from websockets.sync.client import connect
     with connect("wss://mds.qfex.com", open_timeout=8) as ws:
         ws.send(json.dumps({"type": "subscribe", "channels": ["level2"], "symbols": [sym]}))
@@ -260,8 +267,10 @@ VENUES = {
 if APTOS_API_KEY:
     VENUES["Decibel"] = book_decibel
 
-# Which pairs each venue lists (default: all). Metals coverage varies.
-_ALL = set(PAIRS)
+# Which pairs each venue lists (default: crypto + metals, the original core set;
+# equities must be opted into explicitly since most perp DEXes don't carry them).
+_CORE = {"BTC", "ETH", "SOL", "HYPE", "XAU", "XAG"}
+_EQUITIES = {"TSLA", "NVDA", "AAPL", "US500"}
 VENUE_PAIRS = {
     "01": {"BTC", "ETH", "SOL", "HYPE"},
     "HotStuff": {"BTC", "ETH", "SOL", "HYPE"},
@@ -269,15 +278,17 @@ VENUE_PAIRS = {
     "Perpl": {"BTC", "ETH", "SOL", "HYPE"},
     "HyperLiquid": {"BTC", "ETH", "SOL", "HYPE"},  # metals excluded (PAXG proxy not wanted)
     "Nado": {"BTC", "ETH", "SOL", "HYPE", "XAU", "XAG"},  # XAU via XAUT
-    "TradeXYZ": {"XAU", "XAG"},  # xyz:GOLD / xyz:SILVER, metals only
-    "QFEX": {"XAU", "XAG"},      # GOLD-USD / SILVER-USD, metals only
-    "Ondo": {"BTC", "ETH", "XAU", "XAG"},  # no SOL/HYPE listed
-    # Binance: all pairs -- XAU/XAG trade as XAUUSDT/XAGUSDT (TRADIFI_PERPETUAL contracts)
+    "TradeXYZ": {"XAU", "XAG"} | _EQUITIES,  # commodities + equities (xyz:SP500 for US500)
+    "QFEX": {"XAU", "XAG"} | _EQUITIES,      # GOLD-USD / SILVER-USD + {SYM}-USD equities
+    "Ondo": {"BTC", "ETH", "XAU", "XAG"} | _EQUITIES,  # no SOL/HYPE listed
+    # Binance: XAU/XAG + equities trade as TRADIFI_PERPETUAL {SYM}USDT contracts.
+    # US500 excluded: Binance only has the SPY ETF, a proxy (same policy as PAXG-for-gold).
+    "Binance": (_CORE | _EQUITIES) - {"US500"},
 }
 
 
 def venue_supports(name, pair):
-    return pair in VENUE_PAIRS.get(name, _ALL)
+    return pair in VENUE_PAIRS.get(name, _CORE)
 
 # history[(pair, venue)] = deque of (ts, {notional: (buy_bps, sell_bps)})
 _history: dict = {(p, v): deque() for p in PAIRS for v in VENUES}
@@ -545,10 +556,8 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
   <button id="tab-fees">Fee schedules</button>
   <span style="width:12px"></span>
   <button id="fee-toggle" title="add each venue's base taker fee to the slippage numbers">Fees: off</button>
-  <span class="seg" id="selP">
-    <button data-p="BTC" class="on">BTC</button><button data-p="ETH">ETH</button><button data-p="SOL">SOL</button><button data-p="HYPE">HYPE</button><button data-p="XAU">XAU</button><button data-p="XAG">XAG</button>
-  </span>
 </div>
+<div class="tabs" id="selP" style="margin-top:-8px">__PAIR_SELECTOR__</div>
 
 <div id="view-live">
   <div class="controls">
@@ -625,7 +634,7 @@ const TAKER_FEE_BPS = { RISEx:3.0, Extended:2.5, Lighter:0, HyperLiquid:4.5, Nad
 // Schedule context for the Fee-schedules tab (tier used + how the schedule works).
 const FEE_NOTES = {
   Lighter:     ["Standard accounts", "0 maker / 0 taker &mdash; docs say &quot;currently&quot;, permanence not stated. Opt-in Premium accounts pay 2.8bp taker."],
-  TradeXYZ:    ["HIP-3 Growth Mode", "&ge;90% off for Growth-flagged assets (GOLD/SILVER are). Standard mode would be 9.0bp: 4.5 HL base + 4.5 builder."],
+  TradeXYZ:    ["HIP-3 Growth Mode", "&ge;90% off for Growth-flagged assets (GOLD/SILVER confirmed). Standard mode would be 9.0bp: 4.5 HL base + 4.5 builder. Equities assumed Growth Mode too &mdash; unverified."],
   Extended:    ["Flat", "One flat schedule for everyone: 0 maker / 2.5 taker."],
   HotStuff:    ["Standard tier", "The 1.5bp figure sometimes quoted was a metals promo, not the base schedule."],
   RISEx:       ["Base schedule", "1bp maker / 3bp taker, from the mainnet fee config. MM accounts have negotiated overrides."],
@@ -636,9 +645,9 @@ const FEE_NOTES = {
   StandX:      ["Flat", "1bp maker / 4bp taker, appears untiered."],
   HyperLiquid: ["Base tier (<$5M 14d volume)", "Volume-tiered; staking discounts also available."],
   GRVT:        ["Level 1 of 9", "Volume-tiered down to 0 maker at the top levels."],
-  QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown &mdash; the XAU/XAG-relevant class."],
+  QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown; the toggle automatically applies 10bp on TSLA/NVDA/AAPL."],
   Perpl:       ["Base schedule", "Charged on OPEN only, zero on close &mdash; a round trip costs one 6.9bp fee, so ~3.45bp per side effectively. Shown per-order, so Perpl reads worse here than its round-trip cost."],
-  Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. XAU/XAG trade as TRADIFI perpetuals on the same schedule."],
+  Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. Metals and equities trade as TRADIFI perpetuals, same schedule assumed. No US500 &mdash; only the SPY ETF proxy, excluded."],
   Decibel:     ["&mdash;", "Fee not yet researched; shown as 0 in the toggle."],
 };
 function renderFees() {
@@ -655,7 +664,10 @@ function renderFees() {
     `<th style="text-align:left">tier shown</th><th style="text-align:left">schedule notes</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 let feesOn = false;
-const adj = (v, venue) => (v === null || v === undefined) ? v : v + (feesOn ? (TAKER_FEE_BPS[venue] ?? 0) : 0);
+// Per-pair fee exceptions: QFEX prices by asset class (single stocks 10bp vs 5bp base).
+const FEE_PAIR_OVERRIDES = { QFEX: { TSLA: 10.0, NVDA: 10.0, AAPL: 10.0 } };
+const feeFor = venue => (FEE_PAIR_OVERRIDES[venue] || {})[curPair] ?? TAKER_FEE_BPS[venue] ?? 0;
+const adj = (v, venue) => (v === null || v === undefined) ? v : v + (feesOn ? feeFor(venue) : 0);
 const fmtMid = v => v.toLocaleString(undefined, {maximumSignificantDigits: 7});
 const fmtBps = v => (v === null || v === undefined) ? "n/a" : v.toFixed(2);
 const fmtN = n => "$" + (n/1000) + "k";
@@ -1015,7 +1027,14 @@ class Handler(BaseHTTPRequestHandler):
         if pair not in PAIRS:
             pair = "BTC"
         if path == "/":
-            body = PAGE.replace("__VENUE_LIST__", json.dumps(list(VENUES))).encode()
+            sel = "".join(
+                f'<span class="mut" style="font-size:12px;text-transform:uppercase;letter-spacing:.04em">{cls}</span>'
+                + '<span class="seg">'
+                + "".join(f'<button data-p="{p}"{" class=\"on\"" if p == "BTC" else ""}>{p}</button>' for p in ps)
+                + "</span>"
+                for cls, ps in ASSET_CLASSES.items())
+            body = (PAGE.replace("__VENUE_LIST__", json.dumps(list(VENUES)))
+                        .replace("__PAIR_SELECTOR__", sel)).encode()
             ctype = "text/html; charset=utf-8"
         elif path == "/depth":
             out = fetch_pair(pair)
