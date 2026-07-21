@@ -128,6 +128,15 @@ def book_ondo(pair):
     return bids, asks
 
 
+def book_binance(pair):
+    # Binance USDⓈ-M perpetual futures. Public market data, no auth.
+    # Note: geo-blocked (HTTP 451) from US IPs -- surfaces as a per-venue error, not a crash.
+    d = http_json(f"https://fapi.binance.com/fapi/v1/depth?symbol={pair}USDT&limit=500")
+    bids = sorted(((float(p), float(q)) for p, q in d["bids"]), key=lambda x: -x[0])
+    asks = sorted(((float(p), float(q)) for p, q in d["asks"]), key=lambda x: x[0])
+    return bids, asks
+
+
 def book_nado(pair):
     sym = {"XAU": "XAUT"}.get(pair, pair)  # Nado's gold perp is Tether Gold
     d = http_json(f"https://gateway.prod.nado.xyz/v2/orderbook?ticker_id={sym}-PERP_USDT0&depth=100")
@@ -246,6 +255,7 @@ VENUES = {
     "TradeXYZ": book_tradexyz,
     "QFEX": book_qfex,
     "Ondo": book_ondo,
+    "Binance": book_binance,
 }
 if APTOS_API_KEY:
     VENUES["Decibel"] = book_decibel
@@ -262,6 +272,7 @@ VENUE_PAIRS = {
     "TradeXYZ": {"XAU", "XAG"},  # xyz:GOLD / xyz:SILVER, metals only
     "QFEX": {"XAU", "XAG"},      # GOLD-USD / SILVER-USD, metals only
     "Ondo": {"BTC", "ETH", "XAU", "XAG"},  # no SOL/HYPE listed
+    "Binance": {"BTC", "ETH", "SOL", "HYPE"},  # no XAU/XAG perps on Binance futures
 }
 
 
@@ -471,7 +482,7 @@ PAGE = """<!doctype html>
   --card:#ffffff; --hl:#eef;
   --s-risex:#2a78d6; --s-extended:#1baf7a; --s-lighter:#eda100; --s-hyperliquid:#008300; --s-nado:#4a3aa7;
   --s-01:#e34948; --s-decibel:#e87ba4; --s-hotstuff:#eb6834;
-  --s-grvt:#0e9db1; --s-pacifica:#64748b; --s-standx:#8a5a44; --s-perpl:#c026d3; --s-tradexyz:#0369a1; --s-qfex:#4d7c0f; --s-ondo:#b45309;
+  --s-grvt:#0e9db1; --s-pacifica:#64748b; --s-standx:#8a5a44; --s-perpl:#c026d3; --s-tradexyz:#0369a1; --s-qfex:#4d7c0f; --s-ondo:#b45309; --s-binance:#0f172a;
   --buy:#0e7a4f; --sell:#b3372f;
 }
 @media (prefers-color-scheme: dark) {
@@ -480,7 +491,7 @@ PAGE = """<!doctype html>
     --card:#1e1e28; --hl:#22223a;
     --s-risex:#3987e5; --s-extended:#199e70; --s-lighter:#c98500; --s-hyperliquid:#008300; --s-nado:#9085e9;
     --s-01:#e66767; --s-decibel:#d55181; --s-hotstuff:#d95926;
-    --s-grvt:#2fb3c6; --s-pacifica:#94a3b8; --s-standx:#b07a5e; --s-perpl:#d946ef; --s-tradexyz:#38bdf8; --s-qfex:#a3e635; --s-ondo:#f59e0b;
+    --s-grvt:#2fb3c6; --s-pacifica:#94a3b8; --s-standx:#b07a5e; --s-perpl:#d946ef; --s-tradexyz:#38bdf8; --s-qfex:#a3e635; --s-ondo:#f59e0b; --s-binance:#e2e8f0;
     --buy:#3ecf8e; --sell:#ff7a70;
   }
 }
@@ -597,12 +608,13 @@ const VENUES = __VENUE_LIST__;
 const COLORS = { RISEx:"var(--s-risex)", Extended:"var(--s-extended)", Lighter:"var(--s-lighter)",
                  HyperLiquid:"var(--s-hyperliquid)", Nado:"var(--s-nado)",
                  "01":"var(--s-01)", Decibel:"var(--s-decibel)", HotStuff:"var(--s-hotstuff)",
-                 GRVT:"var(--s-grvt)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)", Perpl:"var(--s-perpl)", TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)" };
+                 GRVT:"var(--s-grvt)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)", Perpl:"var(--s-perpl)", TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)", Binance:"var(--s-binance)" };
 const hidden = new Set();  // venues toggled off via the legend
 // Base-tier (worst) taker fees, bps, from official docs 2026-07-19.
 // Perpl charges on open only; TradeXYZ = HIP-3 GROWTH mode (standard mode would be 9.0).
 const TAKER_FEE_BPS = { RISEx:3.0, Extended:2.5, Lighter:0, HyperLiquid:4.5, Nado:3.5,
-  "01":3.5, HotStuff:2.5, GRVT:4.5, Pacifica:4.0, StandX:4.0, Perpl:6.9, TradeXYZ:0.9, QFEX:5.0, Ondo:3.5, Decibel:0 };
+  "01":3.5, HotStuff:2.5, GRVT:4.5, Pacifica:4.0, StandX:4.0, Perpl:6.9, TradeXYZ:0.9, QFEX:5.0, Ondo:3.5, Decibel:0,
+  Binance:5.0 };  // Binance USDS-M VIP 0 (no BNB discount)
 let feesOn = false;
 const adj = (v, venue) => (v === null || v === undefined) ? v : v + (feesOn ? (TAKER_FEE_BPS[venue] ?? 0) : 0);
 const fmtMid = v => v.toLocaleString(undefined, {maximumSignificantDigits: 7});
