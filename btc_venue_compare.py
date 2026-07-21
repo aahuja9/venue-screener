@@ -272,7 +272,7 @@ VENUE_PAIRS = {
     "TradeXYZ": {"XAU", "XAG"},  # xyz:GOLD / xyz:SILVER, metals only
     "QFEX": {"XAU", "XAG"},      # GOLD-USD / SILVER-USD, metals only
     "Ondo": {"BTC", "ETH", "XAU", "XAG"},  # no SOL/HYPE listed
-    "Binance": {"BTC", "ETH", "SOL", "HYPE"},  # no XAU/XAG perps on Binance futures
+    # Binance: all pairs -- XAU/XAG trade as XAUUSDT/XAGUSDT (TRADIFI_PERPETUAL contracts)
 }
 
 
