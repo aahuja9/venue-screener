@@ -542,6 +542,7 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
   <button id="tab-live" class="on">Live</button>
   <button id="tab-time">Over time</button>
   <button id="tab-perc">Percentiles</button>
+  <button id="tab-fees">Fee schedules</button>
   <span style="width:12px"></span>
   <button id="fee-toggle" title="add each venue's base taker fee to the slippage numbers">Fees: off</button>
   <span class="seg" id="selP">
@@ -597,6 +598,12 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
     <div class="mut" style="font-size:12px;margin-top:8px">bps from mid; lower is better. fill% = share of samples where the book could fill the size on both sides.
     Data persists to disk from when the collector first ran, so long timeframes fill in over time.</div></div>
 </div>
+<div id="view-fees" style="display:none">
+  <div class="card"><h2>Taker fee schedules — base tier, no discounts</h2><div id="fees-table"></div>
+    <div class="mut" style="font-size:12px;margin-top:8px">Worst-case (entry-tier) taker fees from official venue docs, verified 2026-07-19/21.
+    These are the numbers the "Fees: on" toggle adds to slippage. Volume tiers, staking and token discounts all lower them &mdash;
+    the base tier is used so every venue is compared at the same starting line.</div></div>
+</div>
 <div class="stamp" id="stamp"></div>
 
 <script>
@@ -615,6 +622,38 @@ const hidden = new Set();  // venues toggled off via the legend
 const TAKER_FEE_BPS = { RISEx:3.0, Extended:2.5, Lighter:0, HyperLiquid:4.5, Nado:3.5,
   "01":3.5, HotStuff:2.5, GRVT:4.5, Pacifica:4.0, StandX:4.0, Perpl:6.9, TradeXYZ:0.9, QFEX:5.0, Ondo:3.5, Decibel:0,
   Binance:5.0 };  // Binance USDS-M VIP 0 (no BNB discount)
+// Schedule context for the Fee-schedules tab (tier used + how the schedule works).
+const FEE_NOTES = {
+  Lighter:     ["Standard accounts", "0 maker / 0 taker &mdash; docs say &quot;currently&quot;, permanence not stated. Opt-in Premium accounts pay 2.8bp taker."],
+  TradeXYZ:    ["HIP-3 Growth Mode", "&ge;90% off for Growth-flagged assets (GOLD/SILVER are). Standard mode would be 9.0bp: 4.5 HL base + 4.5 builder."],
+  Extended:    ["Flat", "One flat schedule for everyone: 0 maker / 2.5 taker."],
+  HotStuff:    ["Standard tier", "The 1.5bp figure sometimes quoted was a metals promo, not the base schedule."],
+  RISEx:       ["Base schedule", "1bp maker / 3bp taker, from the mainnet fee config. MM accounts have negotiated overrides."],
+  Nado:        ["Entry tier ($0 30d volume)", "Volume-tiered; discounts start as 30-day volume grows."],
+  "01":        ["Tier 1 (&le;$5M 30d volume)", "Volume-tiered schedule."],
+  Ondo:        ["Base tier", "RWA/tokenized-equity perp DEX; same fee across its markets."],
+  Pacifica:    ["Tier 1", "Volume-tiered schedule."],
+  StandX:      ["Flat", "1bp maker / 4bp taker, appears untiered."],
+  HyperLiquid: ["Base tier (<$5M 14d volume)", "Volume-tiered; staking discounts also available."],
+  GRVT:        ["Level 1 of 9", "Volume-tiered down to 0 maker at the top levels."],
+  QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown &mdash; the XAU/XAG-relevant class."],
+  Perpl:       ["Base schedule", "Charged on OPEN only, zero on close &mdash; a round trip costs one 6.9bp fee, so ~3.45bp per side effectively. Shown per-order, so Perpl reads worse here than its round-trip cost."],
+  Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. XAU/XAG trade as TRADIFI perpetuals on the same schedule."],
+  Decibel:     ["&mdash;", "Fee not yet researched; shown as 0 in the toggle."],
+};
+function renderFees() {
+  const rows = VENUES.slice().sort((a, b) => (TAKER_FEE_BPS[a] ?? 0) - (TAKER_FEE_BPS[b] ?? 0)).map(v => {
+    const fee = TAKER_FEE_BPS[v] ?? 0;
+    const [tier, note] = FEE_NOTES[v] || ["", ""];
+    return `<tr><td style="text-align:left"><span class="chip" style="background:${COLORS[v]}"></span> ${v}</td>` +
+      `<td><b>${fee.toFixed(1)}</b></td><td class="mut">${(fee / 100).toFixed(3)}%</td>` +
+      `<td style="text-align:left" class="mut">${tier}</td>` +
+      `<td style="text-align:left;max-width:520px" class="mut">${note}</td></tr>`;
+  }).join("");
+  document.getElementById("fees-table").innerHTML =
+    `<table><thead><tr><th style="text-align:left">venue</th><th>taker (bps)</th><th>taker (%)</th>` +
+    `<th style="text-align:left">tier shown</th><th style="text-align:left">schedule notes</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
 let feesOn = false;
 const adj = (v, venue) => (v === null || v === undefined) ? v : v + (feesOn ? (TAKER_FEE_BPS[venue] ?? 0) : 0);
 const fmtMid = v => v.toLocaleString(undefined, {maximumSignificantDigits: 7});
@@ -841,6 +880,11 @@ async function tick() {
       const r = await fetch("/history?pair=" + curPair);
       lastHistory = await r.json();
       renderTime();
+    } else if (curTab === "fees") {
+      renderFees();  // static -- no fetch needed
+      document.getElementById("status").textContent = "";
+      inflight = false;
+      return;
     } else {
       const r = await fetch(`/percentiles?pair=${curPair}&venue=${encodeURIComponent(curVenue)}&minutes=${curT}`);
       renderPerc(await r.json());
@@ -875,15 +919,16 @@ document.getElementById("pause").onclick = e => {
 
 function setTab(t) {
   curTab = t;
-  for (const [id, key] of [["tab-live","live"],["tab-time","time"],["tab-perc","perc"]])
+  for (const [id, key] of [["tab-live","live"],["tab-time","time"],["tab-perc","perc"],["tab-fees","fees"]])
     document.getElementById(id).classList.toggle("on", t === key);
-  for (const [id, key] of [["view-live","live"],["view-time","time"],["view-perc","perc"]])
+  for (const [id, key] of [["view-live","live"],["view-time","time"],["view-perc","perc"],["view-fees","fees"]])
     document.getElementById(id).style.display = t === key ? "" : "none";
   tick();
 }
 document.getElementById("tab-live").onclick = () => setTab("live");
 document.getElementById("tab-time").onclick = () => setTab("time");
 document.getElementById("tab-perc").onclick = () => setTab("perc");
+document.getElementById("tab-fees").onclick = () => setTab("fees");
 document.getElementById("fee-toggle").onclick = e => {
   feesOn = !feesOn;
   e.target.textContent = feesOn ? "Fees: on" : "Fees: off";
