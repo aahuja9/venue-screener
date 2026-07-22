@@ -135,6 +135,20 @@ def book_ondo(pair):
     return bids, asks
 
 
+TXFLOW_IDS = {"BTC": 1, "ETH": 2, "SOL": 13, "HYPE": 44, "XAU": 51, "XAG": 52,
+              "TSLA": 59, "AAPL": 81, "NVDA": 122}  # no US500 index perp (SPY ETF only, excluded)
+
+
+def book_txflow(pair):
+    # TXFLOW L1 -- HyperLiquid-fork API discovered from the app bundle (docs say "coming soon").
+    # POST /info {type:"l2Book", coin:"<numeric id as string>"}; HL levels format [bids, asks].
+    d = http_json("https://api.txflow.com/info",
+                  body={"type": "l2Book", "coin": str(TXFLOW_IDS[pair])})
+    bids = sorted(((float(l["px"]), float(l["sz"])) for l in d["levels"][0]), key=lambda x: -x[0])
+    asks = sorted(((float(l["px"]), float(l["sz"])) for l in d["levels"][1]), key=lambda x: x[0])
+    return bids, asks
+
+
 def book_binance(pair):
     # Binance USDⓈ-M perpetual futures. Public market data, no auth.
     # Note: geo-blocked (HTTP 451) from US IPs -- surfaces as a per-venue error, not a crash.
@@ -263,6 +277,7 @@ VENUES = {
     "QFEX": book_qfex,
     "Ondo": book_ondo,
     "Binance": book_binance,
+    "TXFLOW": book_txflow,
 }
 if APTOS_API_KEY:
     VENUES["Decibel"] = book_decibel
@@ -284,6 +299,7 @@ VENUE_PAIRS = {
     # Binance: XAU/XAG + equities trade as TRADIFI_PERPETUAL {SYM}USDT contracts.
     # US500 excluded: Binance only has the SPY ETF, a proxy (same policy as PAXG-for-gold).
     "Binance": (_CORE | _EQUITIES) - {"US500"},
+    "TXFLOW": (_CORE | _EQUITIES) - {"US500"},  # ids in TXFLOW_IDS; SPY-only for S&P, excluded
 }
 
 
@@ -493,7 +509,7 @@ PAGE = """<!doctype html>
   --card:#ffffff; --hl:#eef;
   --s-risex:#2a78d6; --s-extended:#1baf7a; --s-lighter:#eda100; --s-hyperliquid:#008300; --s-nado:#4a3aa7;
   --s-01:#e34948; --s-decibel:#e87ba4; --s-hotstuff:#eb6834;
-  --s-grvt:#0e9db1; --s-pacifica:#64748b; --s-standx:#8a5a44; --s-perpl:#c026d3; --s-tradexyz:#0369a1; --s-qfex:#4d7c0f; --s-ondo:#b45309; --s-binance:#0f172a;
+  --s-grvt:#0e9db1; --s-pacifica:#64748b; --s-standx:#8a5a44; --s-perpl:#c026d3; --s-tradexyz:#0369a1; --s-qfex:#4d7c0f; --s-ondo:#b45309; --s-binance:#0f172a; --s-txflow:#0d9488;
   --buy:#0e7a4f; --sell:#b3372f;
 }
 @media (prefers-color-scheme: dark) {
@@ -502,7 +518,7 @@ PAGE = """<!doctype html>
     --card:#1e1e28; --hl:#22223a;
     --s-risex:#3987e5; --s-extended:#199e70; --s-lighter:#c98500; --s-hyperliquid:#008300; --s-nado:#9085e9;
     --s-01:#e66767; --s-decibel:#d55181; --s-hotstuff:#d95926;
-    --s-grvt:#2fb3c6; --s-pacifica:#94a3b8; --s-standx:#b07a5e; --s-perpl:#d946ef; --s-tradexyz:#38bdf8; --s-qfex:#a3e635; --s-ondo:#f59e0b; --s-binance:#e2e8f0;
+    --s-grvt:#2fb3c6; --s-pacifica:#94a3b8; --s-standx:#b07a5e; --s-perpl:#d946ef; --s-tradexyz:#38bdf8; --s-qfex:#a3e635; --s-ondo:#f59e0b; --s-binance:#e2e8f0; --s-txflow:#2dd4bf;
     --buy:#3ecf8e; --sell:#ff7a70;
   }
 }
@@ -558,11 +574,12 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
   <button id="fee-toggle" title="add each venue's base taker fee to the slippage numbers">Fees: off</button>
 </div>
 <div class="tabs" id="selP" style="margin-top:-8px">__PAIR_SELECTOR__</div>
+<div class="tabs" id="venueFilter" style="margin-top:-8px;gap:6px"></div>
 
 <div id="view-live">
   <div class="controls">
     <button class="step" id="dec" title="refresh more often">&minus;</button>
-    <div class="val"><span id="ival">5</span>s refresh</div>
+    <div class="val"><span id="ival">500ms</span> refresh</div>
     <button class="step" id="inc">+</button>
     <button id="pause">Pause</button>
     <span id="status" class="sub" style="margin:0"></span>
@@ -616,21 +633,45 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
 <div class="stamp" id="stamp"></div>
 
 <script>
-let intervalSec = 5, timer = null, paused = false, inflight = false;
+let intervalSec = 0.5, timer = null, paused = false, inflight = false;
 let curTab = "live", curPair = "BTC", curN = 10000, curW = 10, curS = "med", lastHistory = null;
 let curVenue = "RISEx", curT = 60;
 const NOTIONALS = [10000, 25000, 50000, 100000, 250000, 500000];
 const VENUES = __VENUE_LIST__;
+const VENUE_PAIRS = __VENUE_PAIRS__;  // {venue: [pairs it lists]}
 const COLORS = { RISEx:"var(--s-risex)", Extended:"var(--s-extended)", Lighter:"var(--s-lighter)",
                  HyperLiquid:"var(--s-hyperliquid)", Nado:"var(--s-nado)",
                  "01":"var(--s-01)", Decibel:"var(--s-decibel)", HotStuff:"var(--s-hotstuff)",
-                 GRVT:"var(--s-grvt)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)", Perpl:"var(--s-perpl)", TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)", Binance:"var(--s-binance)" };
-const hidden = new Set();  // venues toggled off via the legend
+                 GRVT:"var(--s-grvt)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)", Perpl:"var(--s-perpl)", TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)", Binance:"var(--s-binance)", TXFLOW:"var(--s-txflow)" };
+// Per-market venue filter: hiddenByPair[pair] = [venues switched off for that pair].
+// Persisted in localStorage; the chip row below the pair selector and the chart
+// legends both toggle the same state.
+let hiddenByPair = {};
+try { hiddenByPair = JSON.parse(localStorage.getItem("venueFilter") || "{}"); } catch (e) {}
+const isHidden = v => (hiddenByPair[curPair] || []).includes(v);
+function toggleVenue(v) {
+  const arr = hiddenByPair[curPair] || (hiddenByPair[curPair] = []);
+  const i = arr.indexOf(v);
+  i >= 0 ? arr.splice(i, 1) : arr.push(v);
+  try { localStorage.setItem("venueFilter", JSON.stringify(hiddenByPair)); } catch (e) {}
+  renderVenueFilter();
+  tick();
+  if (lastHistory) renderTime();
+}
+function renderVenueFilter() {
+  const el = document.getElementById("venueFilter");
+  const chips = VENUES.filter(v => (VENUE_PAIRS[v] || []).includes(curPair)).map(v =>
+    `<button data-v="${v}" style="padding:4px 10px;font-size:12px;${isHidden(v) ? "opacity:.35" : ""}" ` +
+    `title="${isHidden(v) ? "click to show" : "click to hide"} ${v} on ${curPair}">` +
+    `<span class="chip" style="background:${COLORS[v]}"></span> ${v}</button>`);
+  el.innerHTML = `<span class="mut" style="font-size:12px">venues</span>` + chips.join("");
+  for (const b of el.querySelectorAll("button")) b.onclick = () => toggleVenue(b.dataset.v);
+}
 // Base-tier (worst) taker fees, bps, from official docs 2026-07-19.
 // Perpl charges on open only; TradeXYZ = HIP-3 GROWTH mode (standard mode would be 9.0).
 const TAKER_FEE_BPS = { RISEx:3.0, Extended:2.5, Lighter:0, HyperLiquid:4.5, Nado:3.5,
   "01":3.5, HotStuff:2.5, GRVT:4.5, Pacifica:4.0, StandX:4.0, Perpl:6.9, TradeXYZ:0.9, QFEX:5.0, Ondo:3.5, Decibel:0,
-  Binance:5.0 };  // Binance USDS-M VIP 0 (no BNB discount)
+  Binance:5.0, TXFLOW:4.5 };  // Binance USDS-M VIP 0 (no BNB discount); TXFLOW VIP 0
 // Schedule context for the Fee-schedules tab (tier used + how the schedule works).
 const FEE_NOTES = {
   Lighter:     ["Standard accounts", "0 maker / 0 taker &mdash; docs say &quot;currently&quot;, permanence not stated. Opt-in Premium accounts pay 2.8bp taker."],
@@ -648,6 +689,7 @@ const FEE_NOTES = {
   QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown; the toggle automatically applies 10bp on TSLA/NVDA/AAPL."],
   Perpl:       ["Base schedule", "Charged on OPEN only, zero on close &mdash; a round trip costs one 6.9bp fee, so ~3.45bp per side effectively. Shown per-order, so Perpl reads worse here than its round-trip cost."],
   Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. Metals and equities trade as TRADIFI perpetuals, same schedule assumed. No US500 &mdash; only the SPY ETF proxy, excluded."],
+  TXFLOW:      ["VIP 0 (<$5M 14d volume)", "7-tier schedule down to 2.4bp taker at VIP 6 ($2B+); one flat schedule across all asset classes. HyperLiquid-fork L1."],
   Decibel:     ["&mdash;", "Fee not yet researched; shown as 0 in the toggle."],
 };
 function renderFees() {
@@ -674,7 +716,7 @@ const fmtN = n => "$" + (n/1000) + "k";
 
 /* ---------- Live tab ---------- */
 function summaryTable(data) {
-  const rows = Object.entries(data).map(([name, d]) => {
+  const rows = Object.entries(data).filter(([name]) => !isHidden(name)).map(([name, d]) => {
     if (d.error) return `<tr><td>${name}</td><td colspan=3 class="err">${d.error}</td></tr>`;
     return `<tr><td><span class="chip" style="background:${COLORS[name]}"></span> ${name}</td><td>${fmtMid(d.mid)}</td><td>${d.spread_bps.toFixed(3)} bp</td>
       <td class="mut">${d.stats.n} samples</td></tr>`;
@@ -685,6 +727,7 @@ function summaryTable(data) {
 function simTable(data, notional) {
   let bestBuy = Infinity, bestSell = Infinity;
   for (const [name, d] of Object.entries(data)) {
+    if (isHidden(name)) continue;
     const s = (d.sims || []).find(x => x.notional === notional);
     if (s) {
       const b = adj(s.buy_bps, name), a = adj(s.sell_bps, name);
@@ -692,7 +735,7 @@ function simTable(data, notional) {
       if (a !== null) bestSell = Math.min(bestSell, a);
     }
   }
-  const rows = Object.entries(data).map(([name, d]) => {
+  const rows = Object.entries(data).filter(([name]) => !isHidden(name)).map(([name, d]) => {
     if (d.error) return `<tr><td>${name}</td><td colspan=6 class="err">unavailable</td></tr>`;
     const s = (d.sims || []).find(x => x.notional === notional);
     const st = (d.stats.sims || {})[String(notional)] || null;
@@ -746,7 +789,7 @@ function drawChart(svgId, tipId, hist, side) {
   let vals = [];
   const rawSeries = {}, series = {};
   for (const v of VENUES) {
-    if (hidden.has(v)) continue;
+    if (isHidden(v)) continue;
     const h = hist[v]; if (!h) continue;
     const pts = [];
     for (let i = 0; i < h.t.length; i++) {
@@ -829,7 +872,7 @@ function drawChart(svgId, tipId, hist, side) {
   const legendId = svgId === "chart-buy" ? "legend-buy" : "legend-sell";
   const ranked = [];
   for (const v of VENUES) {
-    if (hidden.has(v)) continue;
+    if (isHidden(v)) continue;
     const pts = series[v] || [];
     let last = null;
     for (let i = pts.length - 1; i >= 0; i--)
@@ -841,15 +884,14 @@ function drawChart(svgId, tipId, hist, side) {
     `<span class="legitem" data-v="${v}" style="cursor:pointer" title="click to hide">` +
     `<span class="mut">${i+1}.</span> <span class="chip" style="background:${COLORS[v]}"></span>${v}` +
     ` <b>${val === null ? "n/a" : val.toFixed(2)}</b></span>`);
-  for (const v of VENUES) if (hidden.has(v))
+  for (const v of VENUES) if (isHidden(v))
     items.push(`<span class="legitem" data-v="${v}" style="cursor:pointer;opacity:.35" title="click to show">` +
       `<span class="chip" style="background:${COLORS[v]}"></span>${v}</span>`);
   document.getElementById(legendId).innerHTML = items.join("");
   for (const el of document.querySelectorAll(`#${legendId} .legitem`)) {
     el.onclick = () => {
       const v = el.dataset.v;
-      hidden.has(v) ? hidden.delete(v) : hidden.add(v);
-      renderTime();
+      toggleVenue(v);
     };
   }
 }
@@ -965,6 +1007,7 @@ document.getElementById("selP").onclick = e => {
   if (e.target.dataset.p) {
     curPair = e.target.dataset.p;
     for (const b of document.querySelectorAll("#selP button")) b.classList.toggle("on", b === e.target);
+    renderVenueFilter();
     tick();
   }
 };
@@ -990,7 +1033,7 @@ document.getElementById("selS").onclick = e => {
   }
 };
 window.addEventListener("resize", renderTime);
-tick(); arm();
+renderVenueFilter(); tick(); arm();
 </script></body></html>"""
 
 
@@ -1033,7 +1076,9 @@ class Handler(BaseHTTPRequestHandler):
                 + "".join(f'<button data-p="{p}"{" class=\"on\"" if p == "BTC" else ""}>{p}</button>' for p in ps)
                 + "</span>"
                 for cls, ps in ASSET_CLASSES.items())
+            vp = {v: [p for p in PAIRS if venue_supports(v, p)] for v in VENUES}
             body = (PAGE.replace("__VENUE_LIST__", json.dumps(list(VENUES)))
+                        .replace("__VENUE_PAIRS__", json.dumps(vp))
                         .replace("__PAIR_SELECTOR__", sel)).encode()
             ctype = "text/html; charset=utf-8"
         elif path == "/depth":
