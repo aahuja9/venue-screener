@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Perp slippage comparison across venues: RISEx, Extended, Lighter, HyperLiquid, Nado.
+"""Perp slippage comparison across venues -- commodities + equities edition.
 
-Pairs: BTC, ETH, SOL, HYPE. Simulates market orders of $10k/$25k/$50k/$100k on
-both sides of each venue's book, computes the impact price (fill VWAP), and
-reports slippage vs the venue's mid in bps. Live tab + over-time chart tab
-(60 min history, sampled every 10s server-side). Serves http://localhost:8900.
+Pairs: XAU, XAG (commodities) and SNDK, SPCX (the RISEx equity listings).
+Simulates market orders on both sides of each venue's book, computes the
+impact price (fill VWAP), and reports slippage vs the venue's mid in bps.
+Live tab + over-time chart tab. Serves http://localhost:8900.
 
 Run:  python3 btc_venue_compare.py
 """
 import gzip
 import json
+import os
 import sqlite3
 import statistics
 import threading
@@ -21,10 +22,9 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8900
 DB_PATH = "venue_samples.db"  # durable sample store (survives restarts)
-PAIRS = ["BTC", "ETH", "SOL", "HYPE", "XAU", "XAG", "SNDK", "SPCX"]
+PAIRS = ["XAU", "XAG", "SNDK", "SPCX"]
 # Asset-class sections shown in the UI pair selector.
 ASSET_CLASSES = {
-    "Crypto": ["BTC", "ETH", "SOL", "HYPE"],
     "Commodities": ["XAU", "XAG"],
     "Equities": ["SNDK", "SPCX"],
 }
@@ -34,16 +34,8 @@ STATS_WINDOW_MIN = 10   # window for the mean/median columns in the Live tab
 HISTORY_MIN = 60        # retention for the over-time charts
 
 # Per-venue market identifiers
-RISEX_IDS = {"BTC": 1, "ETH": 2, "SOL": 4, "HYPE": 5, "XAU": 17, "XAG": 18, "SNDK": 21, "SPCX": 22}
-LIGHTER_IDS = {"BTC": 1, "ETH": 0, "SOL": 2, "HYPE": 24, "XAU": 92, "XAG": 93, "SNDK": 139, "SPCX": 194}
-ZO_IDS = {"BTC": 0, "ETH": 1, "SOL": 2, "HYPE": 3}  # 01 (zo) market ids
-
-# Decibel sits behind the Aptos Labs gateway which requires a (free) API key.
-# Set APTOS_API_KEY in the environment to enable the Decibel column.
-import os
-APTOS_API_KEY = os.environ.get("APTOS_API_KEY", "")
-
-
+RISEX_IDS = {"XAU": 17, "XAG": 18, "SNDK": 21, "SPCX": 22}
+LIGHTER_IDS = {"XAU": 92, "XAG": 93, "SNDK": 139, "SPCX": 194}
 def http_json(url: str, body: dict | None = None, headers: dict | None = None) -> dict:
     hdrs = {"User-Agent": "Mozilla/5.0", "Accept-Encoding": "gzip"}
     if headers:
@@ -103,10 +95,6 @@ def _hl_book(coin):
     return bids, asks
 
 
-def book_hyperliquid(pair):
-    return _hl_book({"XAU": "PAXG"}.get(pair, pair))  # HL's gold perp is PAXG
-
-
 def book_tradexyz(pair):
     # trade.xyz = HIP-3 builder dex "xyz" on Hyperliquid; same l2Book API,
     # coins prefixed "xyz:". Commodities + equities; specials map below.
@@ -137,7 +125,7 @@ def book_ondo(pair):
     return bids, asks
 
 
-TXFLOW_IDS = {"BTC": 1, "ETH": 2, "SOL": 13, "HYPE": 44, "XAU": 51, "XAG": 52}
+TXFLOW_IDS = {"XAU": 51, "XAG": 52}
 
 
 def book_txflow(pair):
@@ -164,39 +152,6 @@ def book_nado(pair):
     d = http_json(f"https://gateway.prod.nado.xyz/v2/orderbook?ticker_id={sym}-PERP_USDT0&depth=100")
     bids = sorted(((float(p), float(q)) for p, q in d["bids"]), key=lambda x: -x[0])
     asks = sorted(((float(p), float(q)) for p, q in d["asks"]), key=lambda x: x[0])
-    return bids, asks
-
-
-def book_01(pair):
-    d = http_json(f"https://zo-mainnet.n1.xyz/market/{ZO_IDS[pair]}/orderbook")
-    bids = sorted(((float(p), float(q)) for p, q in d["bids"]), key=lambda x: -x[0])
-    asks = sorted(((float(p), float(q)) for p, q in d["asks"]), key=lambda x: x[0])
-    return bids, asks
-
-
-def book_hotstuff(pair):
-    d = http_json("https://api.hotstuff.trade/info",
-                  body={"method": "orderbook", "params": {"symbol": f"{pair}-PERP"}})
-    bids = sorted(((float(l["price"]), float(l["size"])) for l in d["bids"]), key=lambda x: -x[0])
-    asks = sorted(((float(l["price"]), float(l["size"])) for l in d["asks"]), key=lambda x: x[0])
-    return bids, asks
-
-
-def book_decibel(pair):
-    if not APTOS_API_KEY:
-        raise RuntimeError("set APTOS_API_KEY to enable Decibel")
-    d = http_json(f"https://api.mainnet.aptoslabs.com/decibel/api/v1/depth?ticker_id={pair}-PERP",
-                  headers={"Authorization": f"Bearer {APTOS_API_KEY}"})
-    bids = sorted(((float(p), float(q)) for p, q in d["bids"]), key=lambda x: -x[0])
-    asks = sorted(((float(p), float(q)) for p, q in d["asks"]), key=lambda x: x[0])
-    return bids, asks
-
-
-def book_grvt(pair):
-    d = http_json("https://market-data.grvt.io/full/v1/book",
-                  body={"instrument": f"{pair}_USDT_Perp", "depth": 50})["result"]
-    bids = [(float(l["price"]), float(l["size"])) for l in d["bids"]]
-    asks = [(float(l["price"]), float(l["size"])) for l in d["asks"]]
     return bids, asks
 
 
@@ -227,89 +182,42 @@ def book_standx(pair):
     return bids, asks
 
 
-# Perpl: no REST orderbook; snapshot comes from a short-lived websocket pull.
-# Market ids + price/size decimals come from the public context endpoint.
-def _perpl_markets() -> dict:
-    d = http_json("https://app.perpl.xyz/api/v1/pub/context")
-    out = {}
-    for m in d["markets"]:
-        name = (m.get("name") or "").upper()
-        if name in ("BTC", "ETH", "SOL", "HYPE"):
-            cfg = m.get("config", {})
-            out[name] = (m["id"], cfg.get("price_decimals", 0), cfg.get("size_decimals", 0))
-    return out
-
-
-try:
-    PERPL_MARKETS = _perpl_markets()
-except Exception:
-    PERPL_MARKETS = {}
-
-
-def book_perpl(pair):
-    if pair not in PERPL_MARKETS:
-        raise RuntimeError("market not found in Perpl context")
-    from websockets.sync.client import connect
-    mid, pdec, sdec = PERPL_MARKETS[pair]
-    with connect("wss://app.perpl.xyz/ws/v1/market-data", open_timeout=8) as ws:
-        ws.send(json.dumps({"mt": 5, "subs": [{"stream": f"order-book@{mid}", "subscribe": True}]}))
-        for _ in range(10):
-            msg = json.loads(ws.recv(timeout=8))
-            if msg.get("mt") == 15:  # L2Book snapshot
-                bids = [(l["p"] / 10**pdec, l["s"] / 10**sdec) for l in msg["bid"]]
-                asks = [(l["p"] / 10**pdec, l["s"] / 10**sdec) for l in msg["ask"]]
-                return bids, asks
-    raise RuntimeError("no orderbook snapshot received")
-
-
 VENUES = {
     "RISEx": book_risex,
     "Extended": book_extended,
     "Lighter": book_lighter,
-    "HyperLiquid": book_hyperliquid,
     "Nado": book_nado,
-    "01": book_01,
-    "HotStuff": book_hotstuff,
-    "GRVT": book_grvt,
     "Pacifica": book_pacifica,
     "StandX": book_standx,
-    "Perpl": book_perpl,
     "TradeXYZ": book_tradexyz,
     "QFEX": book_qfex,
     "Ondo": book_ondo,
     "Binance": book_binance,
     "TXFLOW": book_txflow,
 }
-if APTOS_API_KEY:
-    VENUES["Decibel"] = book_decibel
-
-# Which pairs each venue lists (default: crypto + metals, the original core set;
-# equities must be opted into explicitly since most perp DEXes don't carry them).
-_CORE = {"BTC", "ETH", "SOL", "HYPE", "XAU", "XAG"}
+# Which pairs each venue lists.
+_METALS = {"XAU", "XAG"}
 # Equities = the two stocks listed on RISEx. Comparison set per user: Extended,
-# Ondo, Lighter, TradeXYZ, Nado, QFEX, Binance (TXFLOW et al. stay crypto/metals only).
+# Ondo, Lighter, TradeXYZ, Nado, QFEX, Binance.
 _EQUITIES = {"SNDK", "SPCX"}
 VENUE_PAIRS = {
-    "RISEx": _CORE | _EQUITIES,
-    "01": {"BTC", "ETH", "SOL", "HYPE"},
-    "HotStuff": {"BTC", "ETH", "SOL", "HYPE"},
-    "GRVT": {"BTC", "ETH", "SOL", "HYPE"},
-    "Perpl": {"BTC", "ETH", "SOL", "HYPE"},
-    "HyperLiquid": {"BTC", "ETH", "SOL", "HYPE"},  # metals excluded (PAXG proxy not wanted)
-    "Extended": _CORE | {"SNDK"},  # SPCX market is REDUCE_ONLY (being delisted), excluded
-    "Lighter": _CORE | _EQUITIES,
-    "Nado": _CORE | _EQUITIES,  # XAU via XAUT
-    "TradeXYZ": {"XAU", "XAG"} | _EQUITIES,
-    "QFEX": {"XAU", "XAG"} | _EQUITIES,      # GOLD-USD / SILVER-USD + {SYM}-USD equities
-    "Ondo": {"BTC", "ETH", "XAU", "XAG"} | _EQUITIES,  # no SOL/HYPE listed
+    "RISEx": _METALS | _EQUITIES,
+    "Extended": _METALS | {"SNDK"},  # SPCX market is REDUCE_ONLY (being delisted), excluded
+    "Lighter": _METALS | _EQUITIES,
+    "Nado": _METALS | _EQUITIES,  # XAU via XAUT
+    "Pacifica": _METALS,
+    "StandX": _METALS,
+    "TradeXYZ": _METALS | _EQUITIES,
+    "QFEX": _METALS | _EQUITIES,     # GOLD-USD / SILVER-USD + {SYM}-USD equities
+    "Ondo": _METALS | _EQUITIES,
     # Binance: XAU/XAG + equities trade as TRADIFI_PERPETUAL {SYM}USDT contracts.
-    "Binance": _CORE | _EQUITIES,
-    "TXFLOW": _CORE,
+    "Binance": _METALS | _EQUITIES,
+    "TXFLOW": _METALS,
 }
 
 
 def venue_supports(name, pair):
-    return pair in VENUE_PAIRS.get(name, _CORE)
+    return pair in VENUE_PAIRS.get(name, set())
 
 # history[(pair, venue)] = deque of (ts, {notional: (buy_bps, sell_bps)})
 _history: dict = {(p, v): deque() for p in PAIRS for v in VENUES}
@@ -639,15 +547,15 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
 
 <script>
 let intervalSec = 0.5, timer = null, paused = false, inflight = false;
-let curTab = "live", curPair = "BTC", curN = 10000, curW = 10, curS = "med", lastHistory = null;
+let curTab = "live", curPair = "XAU", curN = 10000, curW = 10, curS = "med", lastHistory = null;
 let curVenue = "RISEx", curT = 60;
 const NOTIONALS = [10000, 25000, 50000, 100000, 250000, 500000];
 const VENUES = __VENUE_LIST__;
 const VENUE_PAIRS = __VENUE_PAIRS__;  // {venue: [pairs it lists]}
 const COLORS = { RISEx:"var(--s-risex)", Extended:"var(--s-extended)", Lighter:"var(--s-lighter)",
-                 HyperLiquid:"var(--s-hyperliquid)", Nado:"var(--s-nado)",
-                 "01":"var(--s-01)", Decibel:"var(--s-decibel)", HotStuff:"var(--s-hotstuff)",
-                 GRVT:"var(--s-grvt)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)", Perpl:"var(--s-perpl)", TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)", Binance:"var(--s-binance)", TXFLOW:"var(--s-txflow)" };
+                 Nado:"var(--s-nado)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)",
+                 TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)",
+                 Binance:"var(--s-binance)", TXFLOW:"var(--s-txflow)" };
 // Per-market venue filter: hiddenByPair[pair] = [venues switched off for that pair].
 // Persisted in localStorage; the chip row below the pair selector and the chart
 // legends both toggle the same state.
@@ -673,29 +581,23 @@ function renderVenueFilter() {
   for (const b of el.querySelectorAll("button")) b.onclick = () => toggleVenue(b.dataset.v);
 }
 // Base-tier (worst) taker fees, bps, from official docs 2026-07-19.
-// Perpl charges on open only; TradeXYZ = HIP-3 GROWTH mode (standard mode would be 9.0).
-const TAKER_FEE_BPS = { RISEx:3.0, Extended:2.5, Lighter:0, HyperLiquid:4.5, Nado:3.5,
-  "01":3.5, HotStuff:2.5, GRVT:4.5, Pacifica:4.0, StandX:4.0, Perpl:6.9, TradeXYZ:0.9, QFEX:5.0, Ondo:3.5, Decibel:0,
+// TradeXYZ = HIP-3 GROWTH mode (standard mode would be 9.0).
+const TAKER_FEE_BPS = { RISEx:3.0, Extended:2.5, Lighter:0, Nado:3.5,
+  Pacifica:4.0, StandX:4.0, TradeXYZ:0.9, QFEX:5.0, Ondo:3.5,
   Binance:5.0, TXFLOW:4.5 };  // Binance USDS-M VIP 0 (no BNB discount); TXFLOW VIP 0
 // Schedule context for the Fee-schedules tab (tier used + how the schedule works).
 const FEE_NOTES = {
   Lighter:     ["Standard accounts", "0 maker / 0 taker &mdash; docs say &quot;currently&quot;, permanence not stated. Opt-in Premium accounts pay 2.8bp taker."],
   TradeXYZ:    ["HIP-3 Growth Mode", "&ge;90% off for Growth-flagged assets (GOLD/SILVER confirmed). Standard mode would be 9.0bp: 4.5 HL base + 4.5 builder. Equities assumed Growth Mode too &mdash; unverified."],
   Extended:    ["Flat", "One flat schedule for everyone: 0 maker / 2.5 taker."],
-  HotStuff:    ["Standard tier", "The 1.5bp figure sometimes quoted was a metals promo, not the base schedule."],
   RISEx:       ["Base schedule", "1bp maker / 3bp taker, from the mainnet fee config. MM accounts have negotiated overrides."],
   Nado:        ["Entry tier ($0 30d volume)", "Volume-tiered; discounts start as 30-day volume grows."],
-  "01":        ["Tier 1 (&le;$5M 30d volume)", "Volume-tiered schedule."],
   Ondo:        ["Base tier", "RWA/tokenized-equity perp DEX; same fee across its markets."],
   Pacifica:    ["Tier 1", "Volume-tiered schedule."],
   StandX:      ["Flat", "1bp maker / 4bp taker, appears untiered."],
-  HyperLiquid: ["Base tier (<$5M 14d volume)", "Volume-tiered; staking discounts also available."],
-  GRVT:        ["Level 1 of 9", "Volume-tiered down to 0 maker at the top levels."],
   QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown; the toggle automatically applies 10bp on SNDK/SPCX."],
-  Perpl:       ["Base schedule", "Charged on OPEN only, zero on close &mdash; a round trip costs one 6.9bp fee, so ~3.45bp per side effectively. Shown per-order, so Perpl reads worse here than its round-trip cost."],
   Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. Metals and equities trade as TRADIFI perpetuals, same schedule assumed."],
   TXFLOW:      ["VIP 0 (<$5M 14d volume)", "7-tier schedule down to 2.4bp taker at VIP 6 ($2B+); one flat schedule across all asset classes. HyperLiquid-fork L1."],
-  Decibel:     ["&mdash;", "Fee not yet researched; shown as 0 in the toggle."],
 };
 function renderFees() {
   const rows = VENUES.slice().sort((a, b) => (TAKER_FEE_BPS[a] ?? 0) - (TAKER_FEE_BPS[b] ?? 0)).map(v => {
@@ -1071,14 +973,14 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         qs = parse_qs(parsed.query)
-        pair = (qs.get("pair") or ["BTC"])[0].upper()
+        pair = (qs.get("pair") or [PAIRS[0]])[0].upper()
         if pair not in PAIRS:
-            pair = "BTC"
+            pair = PAIRS[0]
         if path == "/":
             sel = "".join(
                 f'<span class="mut" style="font-size:12px;text-transform:uppercase;letter-spacing:.04em">{cls}</span>'
                 + '<span class="seg">'
-                + "".join(f'<button data-p="{p}"{" class=\"on\"" if p == "BTC" else ""}>{p}</button>' for p in ps)
+                + "".join(f'<button data-p="{p}"{" class=\"on\"" if p == PAIRS[0] else ""}>{p}</button>' for p in ps)
                 + "</span>"
                 for cls, ps in ASSET_CLASSES.items())
             vp = {v: [p for p in PAIRS if venue_supports(v, p)] for v in VENUES}
