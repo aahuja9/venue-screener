@@ -21,12 +21,12 @@ from urllib.parse import parse_qs, urlparse
 
 PORT = 8900
 DB_PATH = "venue_samples.db"  # durable sample store (survives restarts)
-PAIRS = ["BTC", "ETH", "SOL", "HYPE", "XAU", "XAG", "TSLA", "NVDA", "AAPL", "US500"]
+PAIRS = ["BTC", "ETH", "SOL", "HYPE", "XAU", "XAG", "SNDK", "SPCX"]
 # Asset-class sections shown in the UI pair selector.
 ASSET_CLASSES = {
     "Crypto": ["BTC", "ETH", "SOL", "HYPE"],
     "Commodities": ["XAU", "XAG"],
-    "Equities": ["TSLA", "NVDA", "AAPL", "US500"],
+    "Equities": ["SNDK", "SPCX"],
 }
 NOTIONALS = [10_000, 25_000, 50_000, 100_000, 250_000, 500_000]  # USD trade sizes to simulate
 SAMPLE_SECONDS = 5
@@ -34,8 +34,8 @@ STATS_WINDOW_MIN = 10   # window for the mean/median columns in the Live tab
 HISTORY_MIN = 60        # retention for the over-time charts
 
 # Per-venue market identifiers
-RISEX_IDS = {"BTC": 1, "ETH": 2, "SOL": 4, "HYPE": 5, "XAU": 17, "XAG": 18}
-LIGHTER_IDS = {"BTC": 1, "ETH": 0, "SOL": 2, "HYPE": 24, "XAU": 92, "XAG": 93}
+RISEX_IDS = {"BTC": 1, "ETH": 2, "SOL": 4, "HYPE": 5, "XAU": 17, "XAG": 18, "SNDK": 21, "SPCX": 22}
+LIGHTER_IDS = {"BTC": 1, "ETH": 0, "SOL": 2, "HYPE": 24, "XAU": 92, "XAG": 93, "SNDK": 139, "SPCX": 194}
 ZO_IDS = {"BTC": 0, "ETH": 1, "SOL": 2, "HYPE": 3}  # 01 (zo) market ids
 
 # Decibel sits behind the Aptos Labs gateway which requires a (free) API key.
@@ -71,7 +71,9 @@ def book_risex(pair):
 
 
 def book_extended(pair):
-    d = http_json(f"https://api.starknet.extended.exchange/api/v1/info/markets/{pair}-USD/orderbook")["data"]
+    # SNDK trades as SNDK_24_5-USD; SPCX market (XYZSPCX_ORCLPX-USD) is REDUCE_ONLY, excluded.
+    sym = {"SNDK": "SNDK_24_5"}.get(pair, pair)
+    d = http_json(f"https://api.starknet.extended.exchange/api/v1/info/markets/{sym}-USD/orderbook")["data"]
     bids = sorted(((float(l["price"]), float(l["qty"])) for l in d["bid"]), key=lambda x: -x[0])
     asks = sorted(((float(l["price"]), float(l["qty"])) for l in d["ask"]), key=lambda x: x[0])
     return bids, asks
@@ -108,7 +110,7 @@ def book_hyperliquid(pair):
 def book_tradexyz(pair):
     # trade.xyz = HIP-3 builder dex "xyz" on Hyperliquid; same l2Book API,
     # coins prefixed "xyz:". Commodities + equities; specials map below.
-    sym = {"XAU": "xyz:GOLD", "XAG": "xyz:SILVER", "US500": "xyz:SP500"}.get(pair, f"xyz:{pair}")
+    sym = {"XAU": "xyz:GOLD", "XAG": "xyz:SILVER"}.get(pair, f"xyz:{pair}")
     return _hl_book(sym)
 
 
@@ -135,8 +137,7 @@ def book_ondo(pair):
     return bids, asks
 
 
-TXFLOW_IDS = {"BTC": 1, "ETH": 2, "SOL": 13, "HYPE": 44, "XAU": 51, "XAG": 52,
-              "TSLA": 59, "AAPL": 81, "NVDA": 122}  # no US500 index perp (SPY ETF only, excluded)
+TXFLOW_IDS = {"BTC": 1, "ETH": 2, "SOL": 13, "HYPE": 44, "XAU": 51, "XAG": 52}
 
 
 def book_txflow(pair):
@@ -285,21 +286,25 @@ if APTOS_API_KEY:
 # Which pairs each venue lists (default: crypto + metals, the original core set;
 # equities must be opted into explicitly since most perp DEXes don't carry them).
 _CORE = {"BTC", "ETH", "SOL", "HYPE", "XAU", "XAG"}
-_EQUITIES = {"TSLA", "NVDA", "AAPL", "US500"}
+# Equities = the two stocks listed on RISEx. Comparison set per user: Extended,
+# Ondo, Lighter, TradeXYZ, Nado, QFEX, Binance (TXFLOW et al. stay crypto/metals only).
+_EQUITIES = {"SNDK", "SPCX"}
 VENUE_PAIRS = {
+    "RISEx": _CORE | _EQUITIES,
     "01": {"BTC", "ETH", "SOL", "HYPE"},
     "HotStuff": {"BTC", "ETH", "SOL", "HYPE"},
     "GRVT": {"BTC", "ETH", "SOL", "HYPE"},
     "Perpl": {"BTC", "ETH", "SOL", "HYPE"},
     "HyperLiquid": {"BTC", "ETH", "SOL", "HYPE"},  # metals excluded (PAXG proxy not wanted)
-    "Nado": {"BTC", "ETH", "SOL", "HYPE", "XAU", "XAG"},  # XAU via XAUT
-    "TradeXYZ": {"XAU", "XAG"} | _EQUITIES,  # commodities + equities (xyz:SP500 for US500)
+    "Extended": _CORE | {"SNDK"},  # SPCX market is REDUCE_ONLY (being delisted), excluded
+    "Lighter": _CORE | _EQUITIES,
+    "Nado": _CORE | _EQUITIES,  # XAU via XAUT
+    "TradeXYZ": {"XAU", "XAG"} | _EQUITIES,
     "QFEX": {"XAU", "XAG"} | _EQUITIES,      # GOLD-USD / SILVER-USD + {SYM}-USD equities
     "Ondo": {"BTC", "ETH", "XAU", "XAG"} | _EQUITIES,  # no SOL/HYPE listed
     # Binance: XAU/XAG + equities trade as TRADIFI_PERPETUAL {SYM}USDT contracts.
-    # US500 excluded: Binance only has the SPY ETF, a proxy (same policy as PAXG-for-gold).
-    "Binance": (_CORE | _EQUITIES) - {"US500"},
-    "TXFLOW": (_CORE | _EQUITIES) - {"US500"},  # ids in TXFLOW_IDS; SPY-only for S&P, excluded
+    "Binance": _CORE | _EQUITIES,
+    "TXFLOW": _CORE,
 }
 
 
@@ -686,9 +691,9 @@ const FEE_NOTES = {
   StandX:      ["Flat", "1bp maker / 4bp taker, appears untiered."],
   HyperLiquid: ["Base tier (<$5M 14d volume)", "Volume-tiered; staking discounts also available."],
   GRVT:        ["Level 1 of 9", "Volume-tiered down to 0 maker at the top levels."],
-  QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown; the toggle automatically applies 10bp on TSLA/NVDA/AAPL."],
+  QFEX:        ["Commodities class", "Fees vary by asset class: FX 2bp, commodities/indices 5bp, single stocks 10bp. 5bp shown; the toggle automatically applies 10bp on SNDK/SPCX."],
   Perpl:       ["Base schedule", "Charged on OPEN only, zero on close &mdash; a round trip costs one 6.9bp fee, so ~3.45bp per side effectively. Shown per-order, so Perpl reads worse here than its round-trip cost."],
-  Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. Metals and equities trade as TRADIFI perpetuals, same schedule assumed. No US500 &mdash; only the SPY ETF proxy, excluded."],
+  Binance:     ["VIP 0, USD&#x24C8;-M futures", "Tiered to 1.7bp taker at VIP 9; paying fees in BNB takes a further 10% off. Metals and equities trade as TRADIFI perpetuals, same schedule assumed."],
   TXFLOW:      ["VIP 0 (<$5M 14d volume)", "7-tier schedule down to 2.4bp taker at VIP 6 ($2B+); one flat schedule across all asset classes. HyperLiquid-fork L1."],
   Decibel:     ["&mdash;", "Fee not yet researched; shown as 0 in the toggle."],
 };
@@ -707,7 +712,7 @@ function renderFees() {
 }
 let feesOn = false;
 // Per-pair fee exceptions: QFEX prices by asset class (single stocks 10bp vs 5bp base).
-const FEE_PAIR_OVERRIDES = { QFEX: { TSLA: 10.0, NVDA: 10.0, AAPL: 10.0 } };
+const FEE_PAIR_OVERRIDES = { QFEX: { SNDK: 10.0, SPCX: 10.0 } };
 const feeFor = venue => (FEE_PAIR_OVERRIDES[venue] || {})[curPair] ?? TAKER_FEE_BPS[venue] ?? 0;
 const adj = (v, venue) => (v === null || v === undefined) ? v : v + (feesOn ? feeFor(venue) : 0);
 const fmtMid = v => v.toLocaleString(undefined, {maximumSignificantDigits: 7});
@@ -716,7 +721,7 @@ const fmtN = n => "$" + (n/1000) + "k";
 
 /* ---------- Live tab ---------- */
 function summaryTable(data) {
-  const rows = Object.entries(data).filter(([name]) => !isHidden(name)).map(([name, d]) => {
+  const rows = Object.entries(data).filter(([name, d]) => !isHidden(name) && d.error !== "not listed on this venue").map(([name, d]) => {
     if (d.error) return `<tr><td>${name}</td><td colspan=3 class="err">${d.error}</td></tr>`;
     return `<tr><td><span class="chip" style="background:${COLORS[name]}"></span> ${name}</td><td>${fmtMid(d.mid)}</td><td>${d.spread_bps.toFixed(3)} bp</td>
       <td class="mut">${d.stats.n} samples</td></tr>`;
@@ -735,7 +740,7 @@ function simTable(data, notional) {
       if (a !== null) bestSell = Math.min(bestSell, a);
     }
   }
-  const rows = Object.entries(data).filter(([name]) => !isHidden(name)).map(([name, d]) => {
+  const rows = Object.entries(data).filter(([name, d]) => !isHidden(name) && d.error !== "not listed on this venue").map(([name, d]) => {
     if (d.error) return `<tr><td>${name}</td><td colspan=6 class="err">unavailable</td></tr>`;
     const s = (d.sims || []).find(x => x.notional === notional);
     const st = (d.stats.sims || {})[String(notional)] || null;
