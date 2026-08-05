@@ -10,6 +10,7 @@ Run:  python3 btc_venue_compare.py
 """
 import gzip
 import json
+import math
 import os
 import sqlite3
 import statistics
@@ -29,6 +30,8 @@ ASSET_CLASSES = {
     "Equities": ["SNDK", "SPCX"],
 }
 NOTIONALS = [10_000, 25_000, 50_000, 100_000, 250_000, 500_000]  # USD trade sizes to simulate
+DEPTH_BPS = [1.0, 2.5, 5.0]  # resting-liquidity buckets, distance from mid in bps
+DEPTH_EMA_TAU = 30.0         # EMA time constant (seconds) for the liquidity matrix
 SAMPLE_SECONDS = 5
 STATS_WINDOW_MIN = 10   # window for the mean/median columns in the Live tab
 HISTORY_MIN = 60        # retention for the over-time charts
@@ -223,6 +226,37 @@ def venue_supports(name, pair):
 _history: dict = {(p, v): deque() for p in PAIRS for v in VENUES}
 _history_lock = threading.Lock()
 
+# Resting-liquidity EMA for the Liquidity tab, in memory only (not persisted).
+# _depth_ema[(pair, venue)] = {"1": [bid_usd, ask_usd], "2.5": [...], "5": [...]}
+_depth_ema: dict = {}
+_depth_n: dict = {}   # samples folded into each EMA, so the UI can flag warmup
+_depth_lock = threading.Lock()
+
+
+def update_depth_ema(pair, name, depth, dt):
+    """Fold one sample into the per-venue liquidity EMA (time constant DEPTH_EMA_TAU).
+    Venues that error on a cycle are simply skipped, so a failed fetch never
+    decays the average toward zero."""
+    alpha = 1 - math.exp(-dt / DEPTH_EMA_TAU)
+    key = (pair, name)
+    with _depth_lock:
+        prev = _depth_ema.get(key)
+        if prev is None:
+            _depth_ema[key] = {k: list(v) for k, v in depth.items()}
+            _depth_n[key] = 1
+            return
+        for k, (bid, ask) in depth.items():
+            pb, pa = prev.get(k, (bid, ask))
+            prev[k] = [pb + alpha * (bid - pb), pa + alpha * (ask - pa)]
+        _depth_n[key] = _depth_n.get(key, 0) + 1
+
+
+def depth_snapshot(pair) -> dict:
+    with _depth_lock:
+        return {v: {"depth": {k: list(val) for k, val in _depth_ema[(pair, v)].items()},
+                    "n": _depth_n.get((pair, v), 0)}
+                for v in VENUES if (pair, v) in _depth_ema}
+
 
 def walk_book(levels: list, notional_usd: float) -> float | None:
     """Impact price (fill VWAP) for a market order consuming `notional_usd`.
@@ -242,6 +276,17 @@ def walk_book(levels: list, notional_usd: float) -> float | None:
     return notional_usd / filled_base
 
 
+def book_depth(bids, asks, mid) -> dict:
+    """USD notional resting within N bps of mid, per side, for each DEPTH_BPS bucket.
+    Buckets are cumulative: the 5bp figure includes everything inside 1bp."""
+    out = {}
+    for bps in DEPTH_BPS:
+        lo, hi = mid * (1 - bps / 1e4), mid * (1 + bps / 1e4)
+        out[f"{bps:g}"] = [sum(p * q for p, q in bids if p >= lo),
+                           sum(p * q for p, q in asks if p <= hi)]
+    return out
+
+
 def venue_impact(fetch, pair) -> dict:
     bids, asks = fetch(pair)
     if not bids or not asks:
@@ -259,7 +304,8 @@ def venue_impact(fetch, pair) -> dict:
             "buy_bps": (buy_px - mid) / mid * 1e4 if buy_px else None,
             "sell_bps": (mid - sell_px) / mid * 1e4 if sell_px else None,
         })
-    return {"mid": mid, "spread_bps": (best_ask - best_bid) / mid * 1e4, "sims": sims}
+    return {"mid": mid, "spread_bps": (best_ask - best_bid) / mid * 1e4, "sims": sims,
+            "depth": book_depth(bids, asks, mid)}
 
 
 def fetch_pair(pair) -> dict:
@@ -320,11 +366,18 @@ def _sampler():
     con = sqlite3.connect(DB_PATH)
     jobs = [(p, n, f) for p in PAIRS for n, f in VENUES.items() if venue_supports(n, p)]
     pool = ThreadPoolExecutor(max_workers=len(jobs))  # fully parallel cycle
+    last_cycle = None
     while True:
         now = time.time()
+        # Real elapsed time drives the EMA weight, clamped so a stalled cycle
+        # (or a laptop resuming from sleep) can't blow the average away.
+        dt = SAMPLE_SECONDS if last_cycle is None else min(120.0, max(1.0, now - last_cycle))
+        last_cycle = now
         batch = []
         if True:
             for pair, name, d in pool.map(one, jobs):
+                if d and "depth" in d:
+                    update_depth_ema(pair, name, d["depth"], dt)
                 if d and "sims" in d:
                     point = {s["notional"]: (s["buy_bps"], s["sell_bps"]) for s in d["sims"]}
                     with _history_lock:
@@ -476,10 +529,11 @@ svg .grid { stroke:var(--line); stroke-width:1 }
 svg .xline { stroke:var(--text-secondary); stroke-width:1; opacity:.5 }
 </style></head><body class="viz-root">
 <h1>Perp slippage — venue comparison</h1>
-<div class="sub">simulated market orders ($10k / $25k / $50k / $100k per side) &middot; impact price = fill VWAP walking the live book &middot;
-slippage = distance from the venue's mid, in bps &middot; sampled every 10s server-side, 60 min retained</div>
+<div class="sub">commodities &amp; RWA equities &middot; simulated market orders ($10k&ndash;$500k per side) &middot; impact price = fill VWAP walking the live book &middot;
+slippage = distance from the venue's mid, in bps &middot; sampled every 5s server-side, 60 min retained</div>
 <div class="tabs">
   <button id="tab-live" class="on">Live</button>
+  <button id="tab-liq">Liquidity</button>
   <button id="tab-time">Over time</button>
   <button id="tab-perc">Percentiles</button>
   <button id="tab-fees">Fee schedules</button>
@@ -499,6 +553,20 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
   </div>
   <div class="card"><h2>Live mid &amp; spread</h2><div id="summary"></div></div>
   <div id="sims"></div>
+</div>
+
+<div id="view-liq" style="display:none">
+  <div class="controls">
+    <span class="mut">side</span>
+    <span class="seg" id="selSide">
+      <button data-side="both" class="on">Bid + ask</button><button data-side="bid">Bid</button><button data-side="ask">Ask</button>
+    </span>
+  </div>
+  <div class="card"><h2>Resting liquidity within N bps of mid &mdash; USD notional</h2><div id="liq-table"></div>
+    <div class="mut" style="font-size:12px;margin-top:8px">Sum of resting orders inside each distance from the venue's own mid, so the buckets are
+    cumulative (5bp includes everything inside 1bp). Smoothed server-side as an exponential moving average with a __DEPTH_TAU__s time constant,
+    recomputed once per 5s sample; the page re-reads it every 5s. Higher is better. Venues still warming up (fewer than one full time constant
+    of samples) are marked with a dot.</div></div>
 </div>
 
 <div id="view-time" style="display:none">
@@ -548,10 +616,14 @@ slippage = distance from the venue's mid, in bps &middot; sampled every 10s serv
 <script>
 let intervalSec = 0.5, timer = null, paused = false, inflight = false;
 let curTab = "live", curPair = "XAU", curN = 10000, curW = 10, curS = "med", lastHistory = null;
+let curSide = "both", lastLiq = null;
+const LIQ_REFRESH_MS = 5000;   // the EMA only advances once per 5s sample
 let curVenue = "RISEx", curT = 60;
 const NOTIONALS = [10000, 25000, 50000, 100000, 250000, 500000];
 const VENUES = __VENUE_LIST__;
 const VENUE_PAIRS = __VENUE_PAIRS__;  // {venue: [pairs it lists]}
+const DEPTH_BPS = __DEPTH_BPS__;      // liquidity buckets, as string keys
+const DEPTH_TAU = __DEPTH_TAU__;      // EMA time constant, seconds
 const COLORS = { RISEx:"var(--s-risex)", Extended:"var(--s-extended)", Lighter:"var(--s-lighter)",
                  Nado:"var(--s-nado)", Pacifica:"var(--s-pacifica)", StandX:"var(--s-standx)",
                  TradeXYZ:"var(--s-tradexyz)", QFEX:"var(--s-qfex)", Ondo:"var(--s-ondo)",
@@ -570,6 +642,7 @@ function toggleVenue(v) {
   renderVenueFilter();
   tick();
   if (lastHistory) renderTime();
+  if (lastLiq) renderLiq(lastLiq);
 }
 function renderVenueFilter() {
   const el = document.getElementById("venueFilter");
@@ -826,6 +899,39 @@ function renderPerc(d) {
   document.getElementById("perc-table").innerHTML = html + "</table>";
 }
 
+/* ---------- Liquidity tab ---------- */
+const fmtUsd = v => {
+  if (v === null || v === undefined) return "-";
+  if (v >= 1e9) return "$" + (v/1e9).toFixed(2) + "B";
+  if (v >= 1e6) return "$" + (v/1e6).toFixed(2) + "M";
+  if (v >= 1e3) return "$" + (v/1e3).toFixed(1) + "k";
+  return "$" + v.toFixed(0);
+};
+function liqValue(d, bps) {
+  const v = (d.depth || {})[bps];
+  if (!v) return null;
+  return curSide === "bid" ? v[0] : curSide === "ask" ? v[1] : v[0] + v[1];
+}
+function renderLiq(data) {
+  const rows = Object.entries(data).filter(([name]) => !isHidden(name));
+  const best = {};
+  for (const b of DEPTH_BPS) best[b] = Math.max(-1, ...rows.map(([, d]) => liqValue(d, b) ?? -1));
+  const body = rows.map(([name, d]) => {
+    const cells = DEPTH_BPS.map(b => {
+      const v = liqValue(d, b);
+      return `<td class="${v !== null && v === best[b] ? "best" : ""}">${fmtUsd(v)}</td>`;
+    }).join("");
+    const warming = (d.n || 0) < DEPTH_TAU / 5;   // less than one time constant of samples
+    return `<tr><td style="text-align:left"><span class="chip" style="background:${COLORS[name]}"></span> ${name}` +
+      (warming ? ` <span class="mut" title="EMA still warming up (${d.n} samples)">&middot;</span>` : "") +
+      `</td>${cells}</tr>`;
+  }).join("");
+  document.getElementById("liq-table").innerHTML =
+    `<table><thead><tr><th style="text-align:left">venue</th>` +
+    DEPTH_BPS.map(b => `<th>within ${b} bp</th>`).join("") +
+    `</tr></thead><tbody>${body}</tbody></table>`;
+}
+
 /* ---------- data loop ---------- */
 async function tick() {
   if (paused || inflight) return;
@@ -837,6 +943,10 @@ async function tick() {
       const data = await r.json();
       document.getElementById("summary").innerHTML = summaryTable(data);
       document.getElementById("sims").innerHTML = NOTIONALS.map(n => simTable(data, n)).join("");
+    } else if (curTab === "liq") {
+      const r = await fetch("/liquidity?pair=" + curPair);
+      lastLiq = await r.json();
+      renderLiq(lastLiq);
     } else if (curTab === "time") {
       const r = await fetch("/history?pair=" + curPair);
       lastHistory = await r.json();
@@ -858,7 +968,12 @@ async function tick() {
   } finally { inflight = false; }
 }
 
-function arm() { clearInterval(timer); timer = setInterval(tick, intervalSec*1000); }
+// The Liquidity tab runs on its own fixed 5s cadence; every other tab follows
+// the refresh control.
+function arm() {
+  clearInterval(timer);
+  timer = setInterval(tick, curTab === "liq" ? LIQ_REFRESH_MS : intervalSec*1000);
+}
 function fmtIval(s) { return s < 1 ? (s*1000) + "ms" : s + "s"; }
 function setInterval_(s) {
   intervalSec = Math.min(120, Math.max(0.5, s));
@@ -880,13 +995,15 @@ document.getElementById("pause").onclick = e => {
 
 function setTab(t) {
   curTab = t;
-  for (const [id, key] of [["tab-live","live"],["tab-time","time"],["tab-perc","perc"],["tab-fees","fees"]])
+  for (const [id, key] of [["tab-live","live"],["tab-liq","liq"],["tab-time","time"],["tab-perc","perc"],["tab-fees","fees"]])
     document.getElementById(id).classList.toggle("on", t === key);
-  for (const [id, key] of [["view-live","live"],["view-time","time"],["view-perc","perc"],["view-fees","fees"]])
+  for (const [id, key] of [["view-live","live"],["view-liq","liq"],["view-time","time"],["view-perc","perc"],["view-fees","fees"]])
     document.getElementById(id).style.display = t === key ? "" : "none";
+  arm();   // cadence differs per tab
   tick();
 }
 document.getElementById("tab-live").onclick = () => setTab("live");
+document.getElementById("tab-liq").onclick = () => setTab("liq");
 document.getElementById("tab-time").onclick = () => setTab("time");
 document.getElementById("tab-perc").onclick = () => setTab("perc");
 document.getElementById("tab-fees").onclick = () => setTab("fees");
@@ -916,6 +1033,13 @@ document.getElementById("selP").onclick = e => {
     for (const b of document.querySelectorAll("#selP button")) b.classList.toggle("on", b === e.target);
     renderVenueFilter();
     tick();
+  }
+};
+document.getElementById("selSide").onclick = e => {
+  if (e.target.dataset.side) {
+    curSide = e.target.dataset.side;
+    for (const b of document.querySelectorAll("#selSide button")) b.classList.toggle("on", b === e.target);
+    if (lastLiq) renderLiq(lastLiq);   // re-render from cache, no refetch
   }
 };
 document.getElementById("selN").onclick = e => {
@@ -986,6 +1110,8 @@ class Handler(BaseHTTPRequestHandler):
             vp = {v: [p for p in PAIRS if venue_supports(v, p)] for v in VENUES}
             body = (PAGE.replace("__VENUE_LIST__", json.dumps(list(VENUES)))
                         .replace("__VENUE_PAIRS__", json.dumps(vp))
+                        .replace("__DEPTH_BPS__", json.dumps([f"{b:g}" for b in DEPTH_BPS]))
+                        .replace("__DEPTH_TAU__", str(int(DEPTH_EMA_TAU)))
                         .replace("__PAIR_SELECTOR__", sel)).encode()
             ctype = "text/html; charset=utf-8"
         elif path == "/depth":
@@ -993,6 +1119,9 @@ class Handler(BaseHTTPRequestHandler):
             for name in out:
                 out[name]["stats"] = window_stats(pair, name)
             body = json.dumps(out).encode()
+            ctype = "application/json"
+        elif path == "/liquidity":
+            body = json.dumps(depth_snapshot(pair)).encode()
             ctype = "application/json"
         elif path == "/history":
             body = json.dumps(history_series(pair)).encode()
