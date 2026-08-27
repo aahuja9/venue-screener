@@ -1,4 +1,5 @@
 venue_samples.db
+risex_samples.db
 *.log
 __pycache__/
 .DS_Store
